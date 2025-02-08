@@ -14,6 +14,12 @@
 static bool verbose;
 static volatile int exit_req;
 static volatile int fd;
+
+struct attr_struct {
+    pid_t pid;
+    uint64_t abs_deadline;
+};
+
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
 	if (level == LIBBPF_DEBUG && !verbose)
@@ -26,8 +32,8 @@ static void sigint_handler(int edf)
 	exit_req = 1;
 }
 
-void update_ddl(pid_t pid, u64 ddl, struct scx_edf* skel) {
-    printf("pid: %lu, ddl: %llu is being updated\n", pid, ddl);
+void update_ddl(pid_t pid, __u64 ddl, struct scx_edf* skel) {
+    printf("pid: %d, ddl: %llu is being updated\n", pid, ddl);
     int ret = bpf_map_update_elem(bpf_map__fd(skel->maps.task_ctx_stor), &pid, &ddl, BPF_ANY);
     if (ret < 0) {
         perror("Update deadline failed");
@@ -38,11 +44,11 @@ void update_ddl(pid_t pid, u64 ddl, struct scx_edf* skel) {
 
 void* read_thread(void* arg) {
     struct scx_edf* skel = (struct scx_edf*) arg;
-    char buffer[1024];
+    struct attr_struct edf_attr;
     ssize_t num_read;
 
     while (!exit_req) {
-        num_read = read(fd, buffer, sizeof(buffer) - 1);
+        num_read = read(fd, &edf_attr, sizeof(edf_attr));
         
         if (num_read == -1) {
             if (errno == EBADF || errno == EINTR) {
@@ -52,7 +58,9 @@ void* read_thread(void* arg) {
             }
             perror("read error");
             exit(EXIT_FAILURE);
-        } else if (num_read == 0) {
+        }
+        
+        if (num_read == 0) {
             // Writer closed, reopen FIFO
             close(fd);
             fd = open(FIFO_PATH, O_RDONLY | O_CREAT, 0622);
@@ -63,22 +71,13 @@ void* read_thread(void* arg) {
             }
             continue;
         }
-        
-        buffer[num_read] = '\0';
-        char *endptr;
-        printf("Received: %s\n", buffer);
-        u32 pid = strtoul(buffer, &endptr, 10);
-        int i = 0;
-        while (endptr[i] != ' ' && endptr[i] != '\0') {
-            i++;
-        }
-        if (endptr[i] == '\0') {
+
+        if (num_read != sizeof(struct attr_struct)) {
             printf("cannot find deadline! This request is ignored\n");
             continue;
         }
-        u64 deadline = strtoull(endptr + i, &endptr, 10);
-        printf("pid: %lu, ddl: %llu\n", pid, deadline);
-        update_ddl(pid, deadline, skel);
+        
+        update_ddl(edf_attr.pid, edf_attr.abs_deadline, skel);
     }
     
     return NULL;
