@@ -85,6 +85,20 @@ void* read_thread(void* arg) {
 
 int main(int argc, char **argv)
 {
+    int nr_cpus = 0;
+    int start_cpu = 8;
+    if (argc == 2) {
+        nr_cpus = atoi(argv[1]);
+    }
+    if (argc == 3) {
+        start_cpu = atoi(argv[1]);
+        nr_cpus = atoi(argv[2]);
+    }
+    int cpus_allowed = 0;
+    for (int i = start_cpu; i < start_cpu + nr_cpus; i++) {
+        cpus_allowed |= (1 << i);
+    }
+
     pthread_t thread;
     if (mkfifo(FIFO_PATH, 0666) == -1 && errno != EEXIST) {
         perror("mkfifo failed");
@@ -105,6 +119,7 @@ int main(int argc, char **argv)
 restart:
 	skel = SCX_OPS_OPEN(edf_ops, scx_edf);
     skel->rodata->nr_cpu_ids = libbpf_num_possible_cpus();
+    skel->rodata->cpu_bitmask = cpus_allowed;
 
 	SCX_OPS_LOAD(skel, edf_ops, scx_edf, uei);
     if (pthread_create(&thread, NULL, read_thread, (void*) skel) != 0) {
