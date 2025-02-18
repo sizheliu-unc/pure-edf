@@ -22,8 +22,14 @@ char _license[] SEC("license") = "GPL";
 #define SCHED_EXT		7
 
 const volatile u64 nr_cpu_ids;
+const volatile u64 cpu_bitmask;
+private(NESTS) struct bpf_cpumask __kptr* global_mask;
+
 struct task_ctx {
     u64 deadline;
+};
+struct mask_struct {
+    struct bpf_cpumask* global_mask;
 };
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -32,6 +38,24 @@ struct {
 	__type(value, struct task_ctx);
 } task_ctx_stor SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, u32);
+    __type(value, struct mask_struct);
+    __uint(max_entries, 1);
+} global_cpumask SEC(".maps");
+
+/* Per-CPU scheduler storage */
+struct cpu_ctx {
+    struct bpf_cpumask __kptr *tmp_mask;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, u32);
+    __type(value, struct cpu_ctx);
+    __uint(max_entries, 1);
+} cpu_ctx SEC(".maps");
 
 UEI_DEFINE(uei);
 
@@ -105,6 +129,14 @@ void BPF_STRUCT_OPS(edf_enqueue, struct task_struct *p, u64 enq_flags)
     u64 deadline = get_deadline(p->pid);
     printd("[Enqueue] Task: %u, ddl: %u\n", p->pid, deadline);
     struct task_struct *q;
+    u64 max_ddl = deadline;
+    u32 cur_cpu;
+    s32 cpu;
+    u32 key = 0;
+    struct cpu_ctx *cpu_data;
+    // struct mask_struct *global_mask_struct;
+    // cpumask_t *global_mask;
+    struct bpf_cpumask *and_mask;
     /* 
      * Quickly do a check if there is anything on the shared dsq that has higher prio.
      * If so, then we simply enqueue into the shared dsq, and wait for dispatch. Otherwise,
@@ -121,24 +153,57 @@ void BPF_STRUCT_OPS(edf_enqueue, struct task_struct *p, u64 enq_flags)
             break;
         }
     }
-    u64 max_ddl = deadline;
-    u32 cur_cpu;
-    s32 cpu;
+
+
+    /* Get global cpumask */
+    // global_mask_struct = bpf_map_lookup_elem(&global_cpumask, &key);
+    // if (!global_mask_struct) {
+    //     scx_bpf_error("failed to look up global_mask_struct");
+    //     return;
+    // }
+    // global_mask = (cpumask_t *) global_mask_struct->global_mask;
+
+    /* Get per-CPU context */
+    cpu_data = bpf_map_lookup_elem(&cpu_ctx, &key);
+    if (!cpu_data) {
+        scx_bpf_error("failed to look up cpu_data");
+        return;
+    }
+    if (!cpu_data->tmp_mask) {
+        struct bpf_cpumask *mask = bpf_cpumask_create();
+        if (!mask) {
+            scx_bpf_error("failed to create mask");
+            return;
+        }
+        mask = bpf_kptr_xchg(&cpu_data->tmp_mask, mask);
+        if (mask) {
+            bpf_cpumask_release(mask);
+        }
+    }
+    /* Create temporary cpumask for AND operation */
+    and_mask = cpu_data->tmp_mask;
+    if (!and_mask || !global_mask) {
+        scx_bpf_error("failed to create and_mask");
+        return;
+    }
+    /* Compute intersection */
+    bpf_cpumask_and(and_mask, p->cpus_ptr, (const struct cpumask *) global_mask);
+
     if (enq_flags & SCX_ENQ_REENQ) {
         printd("Reenqueue task!\n");
     }
 
-    if ((cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0)) >= 0) {
+    if ((cpu = scx_bpf_pick_idle_cpu((const struct cpumask *) and_mask, 0)) >= 0) {
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_INF, enq_flags);
         scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
         // scx_bpf_kick_cpu(cpu, 0);
         printd("Task: %u is dispatched to cpu: %u, since the cpu is idle (scx_bpf_pick_idle_cpu)\n", p->pid, cpu);
-        return;
+        goto end;
     }
     cpu = -1;
-    s32 start = bpf_cpumask_first(p->cpus_ptr);
+    s32 start = bpf_cpumask_first((const struct cpumask *) and_mask);
     bpf_for(cur_cpu, start, nr_cpu_ids) {
-        if (!bpf_cpumask_test_cpu(cur_cpu, p->cpus_ptr)) {
+        if (!bpf_cpumask_test_cpu(cur_cpu, (const struct cpumask *) and_mask)) {
             continue;
         }
         /*
@@ -155,7 +220,7 @@ void BPF_STRUCT_OPS(edf_enqueue, struct task_struct *p, u64 enq_flags)
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cur_cpu, SCX_SLICE_INF, enq_flags);
             scx_bpf_kick_cpu(cur_cpu, SCX_KICK_IDLE);
             printd("Task: %u is dispatched to cpu: %u, since the cpu is idle (curr is null)\n", p->pid, cur_cpu);
-            return;
+            goto end;
         }
         /*
          * It is also possible that the current task is ourselves (in case of prio change), in that case, we can just take this CPU.
@@ -165,7 +230,7 @@ void BPF_STRUCT_OPS(edf_enqueue, struct task_struct *p, u64 enq_flags)
             
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cur_cpu, SCX_SLICE_INF, enq_flags); 
             printd("Task: %u is dispatched to cpu: %u, since the cpu is idle (dsq empty)\n", p->pid, cur_cpu);
-            return;
+            goto end;
         }
         /*
             * If it is some other SCHED_EXT task, then we must pick the one with the greatest deadline.
@@ -195,11 +260,13 @@ void BPF_STRUCT_OPS(edf_enqueue, struct task_struct *p, u64 enq_flags)
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_INF, enq_flags);
         scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
         printd("Task: %u is dispatched to cpu: %u, since the cpu is running lower prio job\n", p->pid, cpu);
-        return;
+        goto end;
     }
-enq_global:    
+    
     scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, SCX_SLICE_INF, DEFAULT_DEADLINE - deadline, enq_flags);
     printd("Task: %u is equeue to shared dsq, since no available cpu is found\n", p->pid);
+end:
+    return;
 }
 
 // void BPF_STRUCT_OPS(edf_cpu_acquire, s32 cpu, struct scx_cpu_acquire_args *args)
@@ -226,6 +293,12 @@ s32 BPF_STRUCT_OPS(edf_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 {
     printd("Select CPU for task: %lu!\n", p->pid);
     u64 deadline = get_deadline(p->pid);
+    u32 key = 0;
+    struct cpu_ctx *cpu_data;
+    // struct mask_struct *global_mask_struct;
+    // cpumask_t *global_mask;
+    struct bpf_cpumask *and_mask;
+    s32 cpu = -1;
     /*
      * If there are any task having smaller deadline than us, we cannot run
      * and thus instead enqueue ourselves and wait for a dispatch call, or
@@ -241,23 +314,61 @@ s32 BPF_STRUCT_OPS(edf_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
             break;
         }
     }
+
+
+    /* Get global cpumask */
+    // global_mask_struct = bpf_map_lookup_elem(&global_cpumask, &key);
+    // if (!global_mask_struct) {
+    //     scx_bpf_error("failed to look up global_mask_struct");
+    //     return -1;
+    // }
+    // global_mask = (cpumask_t*) global_mask_struct->global_mask;
+
+    /* Get per-CPU context */
+    cpu_data = bpf_map_lookup_elem(&cpu_ctx, &key);
+    if (!cpu_data) {
+        scx_bpf_error("failed to look up cpu_data");
+        return -1;
+    }
+    if (!cpu_data->tmp_mask) {
+        struct bpf_cpumask *mask = bpf_cpumask_create();
+        if (!mask) {
+            scx_bpf_error("failed to create mask");
+            return -1;
+        }
+        mask = bpf_kptr_xchg(&cpu_data->tmp_mask, mask);
+        if (mask) {
+            bpf_cpumask_release(mask);
+        }
+    }
+    /* Create temporary cpumask for AND operation */
+    and_mask = cpu_data->tmp_mask;
+    if (!and_mask || !global_mask) {
+        scx_bpf_error("failed to create and_mask");
+        return -1;
+    }
+
+    /* Compute intersection */
+    bpf_cpumask_and(and_mask, p->cpus_ptr, (const struct cpumask *) global_mask);
+
     bool is_idle = false;
     s32 dfl_cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-    if (dfl_cpu >= 0 && is_idle) {
+    if (dfl_cpu >= 0 && is_idle && bpf_cpumask_test_cpu(dfl_cpu, (const struct cpumask *) and_mask)) {
         printd("[SELECT] Idle cpu is found on cpu %u!\n", dfl_cpu);
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | dfl_cpu, SCX_SLICE_INF, SCX_ENQ_WAKEUP | SCX_ENQ_CPU_SELECTED);
-        return dfl_cpu;
+        cpu = dfl_cpu;
+        goto end;
     }
     /*
      * If idle cpu is not found, we have to find one with the largest deadline
      */
-    s32 cpu = -1;
+
 
     u64 max_ddl = 0;
-    s32 start = bpf_cpumask_first(p->cpus_ptr);
+    s32 start = bpf_cpumask_first((const struct cpumask *) and_mask);
     s32 cur_cpu;
     bpf_for(cur_cpu, start, nr_cpu_ids) {
-        if (!bpf_cpumask_test_cpu(cur_cpu, p->cpus_ptr)) {
+        if (!bpf_cpumask_test_cpu(cur_cpu, (const struct cpumask *) and_mask)) {
             continue;
         }
         /*
@@ -275,7 +386,8 @@ s32 BPF_STRUCT_OPS(edf_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
         if (!curr || (len == 0 && curr == p)) {
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cur_cpu, SCX_SLICE_INF, SCX_ENQ_WAKEUP | SCX_ENQ_CPU_SELECTED);
             printd("[SELECT] Task: %u is dispatched to cpu: %u, since the cpu is idle (curr is null)\n", p->pid, cur_cpu);
-            return cur_cpu;
+            cpu = cur_cpu;
+            goto end;
         }
         // /*
         //  * It is also possible that the current task is ourselves (in case of prio change), in that case, we can just take this CPU.
@@ -289,7 +401,8 @@ s32 BPF_STRUCT_OPS(edf_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
         if (curr->policy == SCHED_NORMAL && len == 0 && !(curr->flags & PF_KTHREAD)) {
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cur_cpu, SCX_SLICE_INF, SCX_ENQ_WAKEUP | SCX_ENQ_CPU_SELECTED | SCX_ENQ_PREEMPT); 
             printd("[SELECT] Task: %u is dispatched to cpu: %u, since the cpu is running SCHED_NORMAL\n", p->pid, cur_cpu);
-            return cur_cpu;
+            cpu = cur_cpu;
+            goto end;
         }
         /*
          * If it is some other SCHED_EXT task, then we must pick the one with the greatest deadline.
@@ -318,7 +431,7 @@ s32 BPF_STRUCT_OPS(edf_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
     if (cpu >= 0 && deadline < max_ddl) {
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_INF, SCX_ENQ_WAKEUP | SCX_ENQ_CPU_SELECTED | SCX_ENQ_PREEMPT);
         printd("[SELECT] Task: %u is dispatched to cpu: %u, since the cpu is running lower prio job\n", p->pid, cpu);
-        return cpu;
+        goto end;
     }
     p->scx.slice = 0;
     scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, SCX_SLICE_INF, DEFAULT_DEADLINE - deadline, SCX_ENQ_WAKEUP);
@@ -326,6 +439,7 @@ s32 BPF_STRUCT_OPS(edf_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
     if (cpu < 0) {
         cpu = dfl_cpu;
     }
+end:
     return cpu;
 }
 void BPF_STRUCT_OPS(edf_cpu_release, s32 cpu, struct scx_cpu_release_args *args)
@@ -348,6 +462,21 @@ bool BPF_STRUCT_OPS(edf_core_sched_before, struct task_struct *a, struct task_st
 
 void BPF_STRUCT_OPS(edf_dispatch, s32 cpu, struct task_struct *prev)
 {
+    // s32 key = 0;
+    // struct mask_struct * global_mask_struct = bpf_map_lookup_elem(&global_cpumask, &key);
+    // if (!global_mask_struct) {
+    //     scx_bpf_error("failed to look up global_mask_struct");
+    //     return;
+    // }
+    // struct bpf_cpumask* global_mask = global_mask_struct->global_mask;
+    
+    if (!global_mask) {
+        scx_bpf_error("failed to look up global_mask");
+        return;
+    }
+    if (!bpf_cpumask_test_cpu(cpu, (const struct cpumask *) global_mask)) {
+        return;
+    }
 	bool moved = scx_bpf_dsq_move_to_local(SHARED_DSQ);
     if (moved) {
         printd("Dispatch!\n");
@@ -370,6 +499,37 @@ void BPF_STRUCT_OPS(edf_dispatch, s32 cpu, struct task_struct *prev)
 s32 BPF_STRUCT_OPS_SLEEPABLE(edf_init)
 {
     printd("EDF scheduler enabled!\n");
+    // u32 key = 0;
+    // struct mask_struct *global_mask_struct = bpf_map_lookup_elem(&global_cpumask, &key);
+    // if (!global_mask_struct) {
+    //     return -1;
+    // }
+    // global_mask_struct->global_mask = bpf_cpumask_create();
+    // if (!global_mask_struct->global_mask) {
+    //     return -1;
+    // }
+    struct bpf_cpumask* mask = bpf_cpumask_create();
+    if (!mask) {
+        return -ENOMEM;
+    }
+    if (cpu_bitmask) {
+        // bpf_cpumask_clear(global_mask_struct->global_mask);
+        bpf_cpumask_clear(mask);
+        int i;
+        bpf_for (i, 0, nr_cpu_ids) {
+            if (cpu_bitmask & (1 << i)) {
+                // bpf_cpumask_set_cpu(i, global_mask_struct->global_mask);
+                bpf_cpumask_set_cpu(i, mask);
+            }
+        }
+    } else {
+        // bpf_cpumask_setall(global_mask_struct->global_mask);
+        bpf_cpumask_setall(mask);
+    }
+    mask = bpf_kptr_xchg(&global_mask, mask);
+    if (mask) {
+        bpf_cpumask_release(mask);
+    }
 	return scx_bpf_create_dsq(SHARED_DSQ, -1);
 }
 
