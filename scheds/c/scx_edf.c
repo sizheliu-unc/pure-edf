@@ -10,10 +10,12 @@
 #include "scx_edf.bpf.skel.h"
 
 #define FIFO_PATH "/tmp/pure-edf"
+#define ACK_PATH "/tmp/pure-edf-ack"
 
 static bool verbose;
 static volatile int exit_req;
 static volatile int fd;
+static volatile int fd_ack;
 
 struct attr_struct {
     pid_t pid;
@@ -35,11 +37,15 @@ static void sigint_handler(int edf)
 void update_ddl(pid_t pid, __u64 ddl, struct scx_edf* skel) {
     printf("pid: %d, ddl: %llu is being updated\n", pid, ddl);
     int ret = bpf_map_update_elem(bpf_map__fd(skel->maps.task_ctx_stor), &pid, &ddl, BPF_ANY);
+    struct attr_struct ret_val = {pid, ddl};
+    
     if (ret < 0) {
+        ret_val.abs_deadline = 0;
+        write(fd_ack, &ret_val, sizeof(struct attr_struct));
         perror("Update deadline failed");
         return;
     }
-    
+    write(fd_ack, &ret_val, sizeof(struct attr_struct));
 }
 
 void* read_thread(void* arg) {
@@ -64,6 +70,7 @@ void* read_thread(void* arg) {
             // Writer closed, reopen FIFO
             close(fd);
             fd = open(FIFO_PATH, O_RDONLY | O_CREAT, 0622);
+            
             if (fd == -1) {
                 if (exit_req) break;  // Check if we're exiting
                 perror("reopen failed");
@@ -104,7 +111,12 @@ int main(int argc, char **argv)
         perror("mkfifo failed");
         exit(EXIT_FAILURE);
     }
+    if (mkfifo(ACK_PATH, 0666) == -1 && errno != EEXIST) {
+        perror("mkfifo failed");
+        exit(EXIT_FAILURE);
+    }
     fd = open(FIFO_PATH, O_RDONLY | O_CREAT, 0622);
+    fd_ack = open(ACK_PATH, O_WRONLY | O_CREAT, 0666);
     if (fd == -1) {
         perror("open failed");
         exit(EXIT_FAILURE);
