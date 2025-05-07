@@ -25,6 +25,12 @@ const volatile u64 nr_cpu_ids;
 const volatile u64 cpu_bitmask;
 private(NESTS) struct bpf_cpumask __kptr* global_mask;
 
+
+struct set_deadline_struct {
+    pid_t tid;
+    u64 deadline;
+};
+
 struct task_ctx {
     u64 deadline;
 };
@@ -194,7 +200,7 @@ void BPF_STRUCT_OPS(edf_enqueue, struct task_struct *p, u64 enq_flags)
     /* Compute intersection */
     bpf_cpumask_and(and_mask, p->cpus_ptr, (const struct cpumask *) global_mask);
     if (p->flags & PF_KTHREAD) {
-       and_mask = p->cpus_ptr;
+       and_mask = (struct bpf_cpumask*) p->cpus_ptr;
     }
     if (enq_flags & SCX_ENQ_REENQ) {
         printd("Reenqueue task!\n");
@@ -369,7 +375,7 @@ s32 BPF_STRUCT_OPS(edf_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
     /* Compute intersection */
     bpf_cpumask_and(and_mask, p->cpus_ptr, (const struct cpumask *) global_mask);
     if (p->flags & PF_KTHREAD) {
-       and_mask = p->cpus_ptr;
+       and_mask = (struct bpf_cpumask*) p->cpus_ptr;
     }
     bool is_idle = false;
     s32 dfl_cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
@@ -579,6 +585,59 @@ void BPF_STRUCT_OPS(edf_exit, struct scx_exit_info *ei)
     scx_bpf_destroy_dsq(SHARED_DSQ);
 	UEI_RECORD(uei, ei);
 }
+
+/* 
+ * BPF program implementing need_resched.
+ * Expected signature: int need_resched(void *user)
+ */
+SEC("struct_ops/need_resched")
+int BPF_PROG(need_resched, struct task_struct *cur_task, void *user)
+{
+    struct set_deadline_struct *set_deadline = (struct set_deadline_struct *) user;
+    if (!set_deadline) {
+        printd("Set deadline failed: null pointer is passed!\n");
+        return -EINVAL;
+    }
+    pid_t tid;
+    u64 deadline;
+    if (bpf_probe_read_user(&tid, sizeof(pid_t), &set_deadline->tid) || 
+        bpf_probe_read_user(&deadline, sizeof(u64), &set_deadline->deadline)) {
+        printd("Set deadline failed: failed to access data!\n");
+        return -EINVAL;
+    }
+    u32 err = bpf_map_update_elem(&task_ctx_stor, &tid, &deadline, BPF_ANY);
+    if (err != 0) {
+        return -EINVAL;
+    }
+    printd("New deadline written!\n");
+    struct task_struct *target_task = bpf_task_from_pid(tid);
+    if (!target_task) {
+        printd("Failed to find the task in BPF, fail silently.");
+        return 0;
+    }
+    int need_resched = 0;
+    if (target_task->on_cpu) {
+        struct task_struct* q;
+        bpf_for_each(scx_dsq, q, SHARED_DSQ, 0) {
+            if (get_deadline(q->pid) < deadline) {
+                printd("Need resched!\n");
+                need_resched = 1;
+            }
+            break;
+        }
+    }
+    bpf_task_release(target_task);
+    return need_resched;
+}
+
+struct scx_edf_ops {
+    int (*need_resched) (struct task_struct *cur_task, void *user);
+};
+
+SEC(".struct_ops.link")
+struct scx_edf_ops user_scx_edf_ops = {
+    .need_resched = (void*) need_resched
+};
 
 SCX_OPS_DEFINE(edf_ops,
            .runnable          = (void *)edf_runnable,

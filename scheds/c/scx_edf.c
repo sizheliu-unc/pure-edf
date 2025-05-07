@@ -106,21 +106,21 @@ int main(int argc, char **argv)
         cpus_allowed |= (1 << i);
     }
 
-    pthread_t thread;
-    if (mkfifo(FIFO_PATH, 0666) == -1 && errno != EEXIST) {
-        perror("mkfifo failed");
-        exit(EXIT_FAILURE);
-    }
-    if (mkfifo(ACK_PATH, 0666) == -1 && errno != EEXIST) {
-        perror("mkfifo failed");
-        exit(EXIT_FAILURE);
-    }
-    fd = open(FIFO_PATH, O_RDONLY | O_CREAT, 0622);
-    fd_ack = open(ACK_PATH, O_WRONLY | O_CREAT, 0666);
-    if (fd == -1) {
-        perror("open failed");
-        exit(EXIT_FAILURE);
-    }
+    // pthread_t thread;
+    // if (mkfifo(FIFO_PATH, 0666) == -1 && errno != EEXIST) {
+    //     perror("mkfifo failed");
+    //     exit(EXIT_FAILURE);
+    // }
+    // if (mkfifo(ACK_PATH, 0666) == -1 && errno != EEXIST) {
+    //     perror("mkfifo failed");
+    //     exit(EXIT_FAILURE);
+    // }
+    // fd = open(FIFO_PATH, O_RDONLY | O_CREAT, 0622);
+    // fd_ack = open(ACK_PATH, O_WRONLY | O_CREAT, 0666);
+    // if (fd == -1) {
+    //     perror("open failed");
+    //     exit(EXIT_FAILURE);
+    // }
 	struct scx_edf *skel;
 	struct bpf_link *link;
 	__u64 ecode;
@@ -130,17 +130,19 @@ int main(int argc, char **argv)
 	signal(SIGTERM, sigint_handler);
 restart:
 	skel = SCX_OPS_OPEN(edf_ops, scx_edf);
+    printf("Opened.\n");
     skel->rodata->nr_cpu_ids = libbpf_num_possible_cpus();
     skel->rodata->cpu_bitmask = cpus_allowed;
 
 	SCX_OPS_LOAD(skel, edf_ops, scx_edf, uei);
-    if (pthread_create(&thread, NULL, read_thread, (void*) skel) != 0) {
-        perror("pthread_create failed");
-        close(fd);
-        exit(EXIT_FAILURE);
-    }
+    printf("Loaded.\n");
+    // if (pthread_create(&thread, NULL, read_thread, (void*) skel) != 0) {
+    //     perror("pthread_create failed");
+    //     close(fd);
+    //     exit(EXIT_FAILURE);
+    // }
 	link = SCX_OPS_ATTACH(skel, edf_ops, scx_edf);
-
+    printf("Attached.\n");
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
         sleep(1);
 	}
